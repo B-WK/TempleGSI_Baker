@@ -1,6 +1,9 @@
 # TempleGSI_Baker - Setup Utils
 # Copyright (C) 2021 Jvlong2019 <together08@yeah.net>
 
+echo "安装 winget..."
+.\init\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.appxbundle
+
 echo "使用 winget 工具安装依赖..."
 winget install gsudo
 winget install BellSoft.LibericaJDK8Full
