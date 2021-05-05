@@ -13,7 +13,9 @@ winget install GnuWin32.Wget
 winget install python
 winget install git
 winget install Microsoft.VisualStudio.BuildTools
-
+winget install LLVM
+winget install GnuWin32.Make
+ 
 echo "使用 pip 安装 python 依赖..."
 pip install protobuf pycryptodome pycrypto -i https://pypi.tuna.tsinghua.edu.cn/simple/
 pip install init\backports.lzma-0.0.14-cp38-cp38-win32.whl
