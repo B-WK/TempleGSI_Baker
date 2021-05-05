@@ -35,11 +35,13 @@ ADB_KEYS_FILE = '/data/misc/adb/adb_keys'
 ADB_HOST_KEYS_DIR = os.path.join(os.path.expanduser('~'), '.android')
 
 DEFAULT_TIMEOUT = 30
+DEFAULT_LONG_TIMEOUT = DEFAULT_TIMEOUT * 10
+DEFAULT_SUPER_LONG_TIMEOUT = DEFAULT_LONG_TIMEOUT * 2
 DEFAULT_RETRIES = 2
 
 _ADB_VERSION_RE = re.compile(r'Android Debug Bridge version (\d+\.\d+\.\d+)')
 _EMULATOR_RE = re.compile(r'^emulator-[0-9]+$')
-_DEVICE_NOT_FOUND_RE = re.compile(r"error: device '(?P<serial>.+)' not found")
+_DEVICE_NOT_FOUND_RE = re.compile(r"device '(?P<serial>.+)' not found")
 _READY_STATE = 'device'
 _VERITY_DISABLE_RE = re.compile(r'(V|v)erity (is )?(already )?disabled'
                                 r'|Successfully disabled verity')
@@ -303,7 +305,7 @@ class AdbWrapper(object):
     # inconsistent with error reporting so many command failures present
     # differently.
     if status != 0 or (check_error and output.startswith('error:')):
-      not_found_m = _DEVICE_NOT_FOUND_RE.match(output)
+      not_found_m = _DEVICE_NOT_FOUND_RE.search(output)
       device_waiting_m = _WAITING_FOR_DEVICE_RE.match(output)
       if (device_waiting_m is not None
           or (not_found_m is not None
@@ -476,7 +478,7 @@ class AdbWrapper(object):
            local,
            remote,
            sync=False,
-           timeout=60 * 5,
+           timeout=DEFAULT_SUPER_LONG_TIMEOUT,
            retries=DEFAULT_RETRIES):
     """Pushes a file from the host to the device.
 
@@ -549,7 +551,11 @@ class AdbWrapper(object):
 
     self._RunDeviceAdbCmd(push_cmd, timeout, retries)
 
-  def Pull(self, remote, local, timeout=60 * 5, retries=DEFAULT_RETRIES):
+  def Pull(self,
+           remote,
+           local,
+           timeout=DEFAULT_LONG_TIMEOUT,
+           retries=DEFAULT_RETRIES):
     """Pulls a file from the device to the host.
 
     Args:
@@ -832,7 +838,7 @@ class AdbWrapper(object):
               reinstall=False,
               sd_card=False,
               streaming=None,
-              timeout=60 * 2,
+              timeout=DEFAULT_LONG_TIMEOUT,
               retries=DEFAULT_RETRIES):
     """Install an apk on the device.
 
@@ -883,7 +889,7 @@ class AdbWrapper(object):
                       allow_downgrade=False,
                       partial=False,
                       streaming=None,
-                      timeout=60 * 2,
+                      timeout=DEFAULT_LONG_TIMEOUT,
                       retries=DEFAULT_RETRIES):
     """Install an apk with splits on the device.
 
@@ -1002,7 +1008,8 @@ class AdbWrapper(object):
     VerifyLocalFileExists(path)
     self._RunDeviceAdbCmd(['restore'] + [path], timeout, retries)
 
-  def WaitForDevice(self, timeout=60 * 5, retries=DEFAULT_RETRIES):
+  def WaitForDevice(self, timeout=DEFAULT_LONG_TIMEOUT,
+                    retries=DEFAULT_RETRIES):
     """Block until the device is online.
 
     Args:
@@ -1047,7 +1054,9 @@ class AdbWrapper(object):
     """Remounts the /system partition on the device read-write."""
     self._RunDeviceAdbCmd(['remount'], timeout, retries)
 
-  def Reboot(self, to_bootloader=False, timeout=60 * 5,
+  def Reboot(self,
+             to_bootloader=False,
+             timeout=DEFAULT_LONG_TIMEOUT,
              retries=DEFAULT_RETRIES):
     """Reboots the device.
 
@@ -1069,7 +1078,16 @@ class AdbWrapper(object):
       timeout: (optional) Timeout per try in seconds.
       retries: (optional) Number of retries to attempt.
     """
-    output = self._RunDeviceAdbCmd(['root'], timeout, retries)
+    try:
+      output = self._RunDeviceAdbCmd(['root'], timeout, retries)
+    except device_errors.AdbCommandFailedError as e:
+      # For some devices, root can occasionally fail with this error and kick
+      # the device into adb 'offline' mode. Assuming this is transient, try
+      # waiting for the device to come back up before re-raising the exception
+      # and proceeding with any retries.
+      if 'unable to connect for root: closed' in e.output:
+        self.WaitForDevice()
+      raise
     if 'cannot' in output:
       raise device_errors.AdbCommandFailedError(
           ['root'], output, device_serial=self._device_serial)
@@ -1115,6 +1133,7 @@ class AdbWrapper(object):
           ['enable-verity'], output, device_serial=self._device_serial)
     return output
 
+  # Deprecated use device_utils#is_emulator instead.
   @property
   def is_emulator(self):
     return _EMULATOR_RE.match(self._device_serial)

@@ -45,7 +45,8 @@ from devil.utils import reraiser_thread
 from devil.utils import timeout_retry
 from devil.utils import zip_utils
 
-from py_utils import tempfile_ext
+with devil_env.SysPath(devil_env.PY_UTILS_PATH):
+  from py_utils import tempfile_ext
 
 try:
   from devil.utils import reset_usb
@@ -132,6 +133,7 @@ _PERMISSIONS_DENYLIST_RE = re.compile('|'.join(
         'android.permission.MANAGE_ACCOUNTS',
         'android.permission.MODIFY_AUDIO_SETTINGS',
         'android.permission.NFC',
+        'android.permission.QUERY_ALL_PACKAGES',
         'android.permission.READ_SYNC_SETTINGS',
         'android.permission.READ_SYNC_STATS',
         'android.permission.RECEIVE_BOOT_COMPLETED',
@@ -276,6 +278,15 @@ _WEBVIEW_SYSUPDATE_MIN_VERSION_CODE = re.compile(
     r'Minimum WebView version code: (\d+)')
 
 _GOOGLE_FEATURES_RE = re.compile(r'^\s*com\.google\.')
+
+_EMULATOR_RE = re.compile(r'^generic_.*$')
+
+# Regular expressions for determining if a package is installed using the
+# output of `dumpsys package`.
+# Matches lines like "Package [com.google.android.youtube] (c491050):".
+# or "Package [org.chromium.trichromelibrary_425300033] (e476383):"
+_DUMPSYS_PACKAGE_RE_STR =\
+    r'^\s*Package\s*\[%s(_(?P<version_code>\d*))?\]\s*\(\w*\):$'
 
 PS_COLUMNS = ('name', 'pid', 'ppid')
 ProcessInfo = collections.namedtuple('ProcessInfo', PS_COLUMNS)
@@ -556,22 +567,14 @@ class DeviceUtils(object):
       CommandTimeoutError on timeout.
       DeviceUnreachableError on missing device.
     """
-    try:
-      if self.build_type == 'eng':
-        # 'eng' builds have root enabled by default and the adb session cannot
-        # be unrooted.
-        return True
-      # Devices using the system-as-root partition layout appear to not have
-      # a /root directory. See http://bit.ly/37F34sx for more context.
-      if (self.build_system_root_image == 'true'
-          or self.build_version_sdk >= version_codes.Q
-          # This may be redundant with the checks above.
-          or self.product_name in _SPECIAL_ROOT_DEVICE_LIST):
-        return self.GetProp('service.adb.root') == '1'
-      self.RunShellCommand(['ls', '/root'], check_return=True)
+    if self.build_type == 'eng':
+      # 'eng' builds have root enabled by default and the adb session cannot
+      # be unrooted.
       return True
-    except device_errors.AdbCommandFailedError:
-      return False
+    # Check if uid is 0. Such behavior has remained unchanged since
+    # android 2.2.3 (https://bit.ly/2QQzg67)
+    output = self.RunShellCommand(['id'], single_line=True)
+    return output.startswith('uid=0(root)')
 
   def NeedsSU(self, timeout=DEFAULT, retries=DEFAULT):
     """Checks whether 'su' is needed to access protected resources.
@@ -638,8 +641,7 @@ class DeviceUtils(object):
       self.adb.Root()
     except device_errors.AdbCommandFailedError as e:
       if self.IsUserBuild():
-        raise device_errors.CommandFailedError(
-            'Unable to root device with user build.', str(self))
+        raise device_errors.RootUserBuildError(device_serial=str(self))
       elif e.output and _WAIT_FOR_DEVICE_TIMEOUT_STR in e.output:
         # adb 1.0.41 added a call to wait-for-device *inside* root
         # with a timeout that can be too short in some cases.
@@ -768,21 +770,50 @@ class DeviceUtils(object):
     raise device_errors.CommandFailedError('Unable to fetch IMEI.')
 
   @decorators.WithTimeoutAndRetriesFromInstance()
-  def IsApplicationInstalled(self, package, timeout=None, retries=None):
+  def IsApplicationInstalled(
+      self, package, version_code=None, timeout=None, retries=None):
     """Determines whether a particular package is installed on the device.
 
     Args:
       package: Name of the package.
+      version_code: The version of the package to check for as an int, if
+          applicable. Only used for static shared libraries, otherwise ignored.
 
     Returns:
       True if the application is installed, False otherwise.
     """
-    # `pm list packages` allows matching substrings, but we want exact matches
-    # only.
-    matching_packages = self.RunShellCommand(
-        ['pm', 'list', 'packages', package], check_return=True)
-    desired_line = 'package:' + package
-    return desired_line in matching_packages
+    # `pm list packages` doesn't include the version code, so if it was
+    # provided, skip this since we can't guarantee that the installed
+    # version is the requested version.
+    if version_code is None:
+      # `pm list packages` allows matching substrings, but we want exact matches
+      # only.
+      matching_packages = self.RunShellCommand(
+          ['pm', 'list', 'packages', package], check_return=True)
+      desired_line = 'package:' + package
+      found_package = desired_line in matching_packages
+      if found_package:
+        return True
+
+    # Some packages do not properly show up via `pm list packages`, so fall back
+    # to checking via `dumpsys package`.
+    matcher = re.compile(_DUMPSYS_PACKAGE_RE_STR % package)
+    dumpsys_output = self.RunShellCommand(
+        ['dumpsys', 'package'], check_return=True, large_output=True)
+    for line in dumpsys_output:
+      match = matcher.match(line)
+      # We should have one of these cases:
+      # 1. The package is a regular app, in which case it will show up without
+      #    its version code in the line we're filtering for.
+      # 2. The package is a static shared library, in which case one or more
+      #    entries with the version code can show up, but not one without the
+      #    version code.
+      if match:
+        installed_version_code = match.groupdict().get('version_code')
+        if (installed_version_code is None
+            or installed_version_code == str(version_code)):
+          return True
+    return False
 
   @decorators.WithTimeoutAndRetriesFromInstance()
   def GetApplicationPaths(self, package, timeout=None, retries=None):
@@ -1062,6 +1093,10 @@ class DeviceUtils(object):
              retries=None):
     """Reboot the device.
 
+    Note if the device has the root privilege, it will likely lose it after the
+    reboot. When |block| is True, it will try to restore the root status if
+    applicable.
+
     Args:
       block: A boolean indicating if we should wait for the reboot to complete.
       wifi: A boolean indicating if we should wait for wifi to be enabled after
@@ -1081,11 +1116,15 @@ class DeviceUtils(object):
     def device_offline():
       return not self.IsOnline()
 
+    # Only check the root when block is True
+    should_restore_root = self.HasRoot() if block else False
     self.adb.Reboot()
     self.ClearCache()
     timeout_retry.WaitFor(device_offline, wait_period=1)
     if block:
       self.WaitUntilFullyBooted(wifi=wifi, decrypt=decrypt)
+      if should_restore_root:
+        self.EnableRoot()
 
   INSTALL_DEFAULT_TIMEOUT = 8 * _DEFAULT_TIMEOUT
   MODULES_SRC_DIRECTORY_PATH = '/data/local/tmp/modules'
@@ -1282,6 +1321,7 @@ class DeviceUtils(object):
         apks_to_install = apk_paths
 
     if device_apk_paths and apks_to_install and not reinstall:
+      logger.info('Uninstalling package %s', package_name)
       self.Uninstall(package_name)
 
     if apks_to_install:
@@ -1292,6 +1332,8 @@ class DeviceUtils(object):
       streaming = None
       if self.product_name in _NO_STREAMING_DEVICE_LIST:
         streaming = False
+      logger.info('Installing package %s using APKs %s',
+                  package_name, apks_to_install)
       if len(apks_to_install) > 1 or partial:
         self.adb.InstallMultiple(
             apks_to_install,
@@ -1306,9 +1348,19 @@ class DeviceUtils(object):
             streaming=streaming,
             allow_downgrade=allow_downgrade)
     else:
+      logger.info('Skipping installation of package %s', package_name)
       # Running adb install terminates running instances of the app, so to be
       # consistent, we explicitly terminate it when skipping the install.
       self.ForceStop(package_name)
+
+    # There have been cases of APKs not being detected after being explicitly
+    # installed, so perform a sanity check now and fail early if the
+    # installation somehow failed.
+    apk_version = apk.GetVersionCode()
+    if not self.IsApplicationInstalled(package_name, apk_version):
+      raise device_errors.CommandFailedError(
+          'Package %s with version %s not installed on device after explicit '
+          'install attempt.' % (package_name, apk_version))
 
     if (permissions is None
         and self.build_version_sdk >= version_codes.MARSHMALLOW):
@@ -2045,9 +2097,14 @@ class DeviceUtils(object):
   def _ComputeDeviceChecksumsForApks(self, package_name):
     ret = self._cache['package_apk_checksums'].get(package_name)
     if ret is None:
-      device_paths = self._GetApplicationPathsInternal(package_name)
-      file_to_checksums = md5sum.CalculateDeviceMd5Sums(device_paths, self)
-      ret = set(file_to_checksums.values())
+      if self.PathExists('/data/data/' + package_name, as_root=True):
+        device_paths = self._GetApplicationPathsInternal(package_name)
+        file_to_checksums = md5sum.CalculateDeviceMd5Sums(device_paths, self)
+        ret = set(file_to_checksums.values())
+      else:
+        logger.info('Cannot reuse package %s (data directory missing)',
+                    package_name)
+        ret = set()
       self._cache['package_apk_checksums'][package_name] = ret
     return ret
 
@@ -2720,9 +2777,14 @@ class DeviceUtils(object):
   @property
   def pixel_density(self):
     density = self.GetProp('ro.sf.lcd_density', cache=True)
-    if not density and self.adb.is_emulator:
+    if not density:
+      # It might be an emulator, try the qemu prop.
       density = self.GetProp('qemu.sf.lcd_density', cache=True)
     return int(density)
+
+  @property
+  def is_emulator(self):
+    return _EMULATOR_RE.match(self.GetProp('ro.product.device', cache=True))
 
   @property
   def build_description(self):
@@ -3186,11 +3248,12 @@ class DeviceUtils(object):
         WebViewPackages: Dict of installed WebView providers, mapping "package
             name" to "reason it's valid/invalid."
 
-    It may return an empty dictionary if device does not
-    support the "dumpsys webviewupdate" command.
+    The returned dictionary may not include all of the above keys: this depends
+    on the support of the platform's underlying WebViewUpdateService. This may
+    return an empty dictionary on OS versions which do not support querying the
+    WebViewUpdateService.
 
     Raises:
-      CommandFailedError on failure.
       CommandTimeoutError on timeout.
       DeviceUnreachableError on missing device.
     """
@@ -3229,12 +3292,6 @@ class DeviceUtils(object):
         result['MinimumWebViewVersionCode'] = int(match.group(1))
     if webview_packages:
       result['WebViewPackages'] = webview_packages
-
-    missing_fields = set(['CurrentWebViewPackage', 'FallbackLogicEnabled']) - \
-                     set(result.keys())
-    if len(missing_fields) > 0:
-      raise device_errors.CommandFailedError(
-          '%s not found in dumpsys webviewupdate' % str(list(missing_fields)))
     return result
 
   @decorators.WithTimeoutAndRetriesFromInstance()
@@ -3552,9 +3609,6 @@ class DeviceUtils(object):
                      retries=1,
                      enable_usb_resets=False,
                      abis=None,
-                     # TODO(crbug.com/1097306): Remove this once clients have
-                     # stopped passing it.
-                     blacklist=None,
                      **kwargs):
     """Returns a list of DeviceUtils instances.
 
@@ -3606,10 +3660,6 @@ class DeviceUtils(object):
       select_multiple = False
       if device_arg:
         device_arg = (device_arg, )
-
-    # TODO(crbug.com/1097306): Remove this once clients have switched.
-    if blacklist and not denylist:
-      denylist = blacklist
 
     denylisted_devices = denylist.Read() if denylist else []
 
